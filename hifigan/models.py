@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
-from utils import init_weights, get_padding
+from hifigan.utils import init_weights, get_padding
 
 LRELU_SLOPE = 0.1
 
@@ -78,14 +78,20 @@ class Generator(torch.nn.Module):
         self.h = h
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
-        self.conv_pre = weight_norm(Conv1d(80, h.upsample_initial_channel, 7, 1, padding=3))
+        self.conv_pre = weight_norm(Conv1d(128, h.upsample_initial_channel, 7, 1, padding=3))
         resblock = ResBlock1 if h.resblock == '1' else ResBlock2
 
         self.ups = nn.ModuleList()
+        # NOTE: keeping this just to have an idea how G was mounted, assuming 256 hop size
+#        for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
+#            self.ups.append(weight_norm(
+#                ConvTranspose1d(h.upsample_initial_channel//(2**i), h.upsample_initial_channel//(2**(i+1)),
+#                                k, u, padding=(k-u)//2)))
+
         for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
             self.ups.append(weight_norm(
                 ConvTranspose1d(h.upsample_initial_channel//(2**i), h.upsample_initial_channel//(2**(i+1)),
-                                k, u, padding=(k-u)//2)))
+                                k, u, padding=u // 2 + u % 2, output_padding=u % 2)))
 
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):

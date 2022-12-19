@@ -5,6 +5,22 @@ import torch
 from torch.nn.utils import weight_norm
 matplotlib.use("Agg")
 import matplotlib.pylab as plt
+import numpy as np
+
+
+def read_binfile(filename, ncols=None, dtype=np.float32):
+    """Reads binary float file into numpy array.
+    Returns [numpy-array, np.float32]
+    """
+    m_data = None
+    with open(filename, 'rb') as infile:
+        v_data = np.fromfile(infile, dtype=dtype)
+        if ncols is None:
+            return v_data.astype('float32')
+        if np.mod(v_data.size, ncols) != 0:
+            raise ValueError('Dimension provided not compatible with file size.')
+        m_data = v_data.reshape((-1, ncols)).astype('float32')
+    return m_data
 
 
 def plot_spectrogram(spectrogram):

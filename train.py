@@ -1,10 +1,10 @@
 import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
 import itertools
 import os
 import time
 import argparse
 import json
+
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
@@ -12,11 +12,15 @@ from torch.utils.data import DistributedSampler, DataLoader
 import torch.multiprocessing as mp
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
-from env import AttrDict, build_env
-from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
-from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
-    discriminator_loss
-from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
+
+from hifigan.env import AttrDict, build_env
+from hifigan.meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
+from hifigan.models import Generator, \
+                            MultiPeriodDiscriminator, MultiScaleDiscriminator, \
+                            feature_loss, generator_loss, discriminator_loss
+from hifigan.utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 torch.backends.cudnn.benchmark = True
 
@@ -99,6 +103,7 @@ def train(rank, a, h):
 
         sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
 
+    smallest_val_err = 1_000_000_000
     generator.train()
     mpd.train()
     msd.train()
@@ -113,10 +118,14 @@ def train(rank, a, h):
         for i, batch in enumerate(train_loader):
             if rank == 0:
                 start_b = time.time()
-            x, y, _, y_mel = batch
+#            x, y, _, y_mel = batch
+            x, y, _ = batch
             x = torch.autograd.Variable(x.to(device, non_blocking=True))
             y = torch.autograd.Variable(y.to(device, non_blocking=True))
-            y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+            # NOTE: keeping this part just as a reference to what was being done before
+            #y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+            y_mel = mel_spectrogram(y, h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
+                                           h.fmin, h.fmax_for_loss)
             y = y.unsqueeze(1)
 
             y_g_hat = generator(x)
@@ -161,8 +170,8 @@ def train(rank, a, h):
                     with torch.no_grad():
                         mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
 
-                    print('Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
-                          format(steps, loss_gen_all, mel_error, time.time() - start_b))
+                    print('Epoch: {:d}, Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
+                          format(epoch, steps, loss_gen_all, mel_error, time.time() - start_b))
 
                 # checkpointing
                 if steps % a.checkpoint_interval == 0 and steps != 0:
@@ -181,6 +190,7 @@ def train(rank, a, h):
                 # Tensorboard summary logging
                 if steps % a.summary_interval == 0:
                     sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
+                    sw.add_scalar("training/disc_loss_total", loss_disc_all, steps)
                     sw.add_scalar("training/mel_spec_error", mel_error, steps)
 
                 # Validation
@@ -190,12 +200,19 @@ def train(rank, a, h):
                     val_err_tot = 0
                     with torch.no_grad():
                         for j, batch in enumerate(validation_loader):
-                            x, y, _, y_mel = batch
+                            #x, y, _, y_mel = batch
+                            x, y, _ = batch
                             y_g_hat = generator(x.to(device))
-                            y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+                            # NOTE: keeping this part just as a reference to what was being done before
+                            #y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+                            y_mel = mel_spectrogram(y.to(device), h.n_fft, h.num_mels, h.sampling_rate,
+                                                          h.hop_size, h.win_size,
+                                                          h.fmin, h.fmax_for_loss)
                             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
                                                           h.hop_size, h.win_size,
                                                           h.fmin, h.fmax_for_loss)
+                            nframes = y_mel.size(2)
+                            y_g_hat_mel = y_g_hat_mel[:,:,:nframes]
                             val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
                             if j <= 4:
@@ -213,13 +230,27 @@ def train(rank, a, h):
                         val_err = val_err_tot / (j+1)
                         sw.add_scalar("validation/mel_spec_error", val_err, steps)
 
+                        if val_err < smallest_val_err:
+                            checkpoint_path = "{}/best_netG.pt".format(a.checkpoint_path)
+                            save_checkpoint(checkpoint_path,
+                                    {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
+                            checkpoint_path = "{}/best_netD.pt".format(a.checkpoint_path)
+                            save_checkpoint(checkpoint_path,
+                                    {'mpd': (mpd.module if h.num_gpus > 1
+                                                         else mpd).state_dict(),
+                                     'msd': (msd.module if h.num_gpus > 1
+                                                         else msd).state_dict(),
+                                     'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
+                                     'epoch': epoch})
+
+
                     generator.train()
 
             steps += 1
 
         scheduler_g.step()
         scheduler_d.step()
-        
+ 
         if rank == 0:
             print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
 
@@ -230,16 +261,16 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--group_name', default=None)
-    parser.add_argument('--input_wavs_dir', default='LJSpeech-1.1/wavs')
-    parser.add_argument('--input_mels_dir', default='ft_dataset')
-    parser.add_argument('--input_training_file', default='LJSpeech-1.1/training.txt')
-    parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
+    parser.add_argument('--input_wavs_dir', default='female2/wav')
+    parser.add_argument('--input_mels_dir', default='female2/mels')
+    parser.add_argument('--input_training_file', default='female2/train_files.txt')
+    parser.add_argument('--input_validation_file', default='female2/test_files.txt')
     parser.add_argument('--checkpoint_path', default='cp_hifigan')
     parser.add_argument('--config', default='')
     parser.add_argument('--training_epochs', default=3100, type=int)
     parser.add_argument('--stdout_interval', default=5, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
-    parser.add_argument('--summary_interval', default=100, type=int)
+    parser.add_argument('--summary_interval', default=1000, type=int)
     parser.add_argument('--validation_interval', default=1000, type=int)
     parser.add_argument('--fine_tuning', default=False, type=bool)
 
